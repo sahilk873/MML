@@ -24,8 +24,8 @@ artifacts/
 artifacts_beta/
 logs/
 codex_auth.zip
+.codex/
 
 # Local credentials & env files
 .env
 *.env
-
