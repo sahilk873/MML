@@ -1,0 +1,31 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Notebook and tooling cruft
+.ipynb_checkpoints/
+.DS_Store
+
+# Project artifacts and logs
+artifacts/
+artifacts_beta/
+logs/
+codex_auth.zip
+
+# Local credentials & env files
+.env
+*.env
+
