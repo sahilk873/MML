@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from kg_project.eval.predict import write_metrics, write_predictions, write_report
 from kg_project.io.csv_loader import read_label_csvs, save_labels_clean
 from kg_project.io.parquet_loader import list_kg_parts, log_kg_stats, persist_kg, read_kg
-from kg_project.kg_embed.pykeen_train import train_pykeen
+from kg_project.kg_embed.pykeen_train import ensure_real_embeddings, train_pykeen
 from kg_project.kg_embed.subgraph import extract_subgraph
 from kg_project.model.dataset import FeatureDataset, IDTripleDataset
 from kg_project.model.mlp import FeatureClassifier, IDEmbeddingModel
@@ -41,6 +41,61 @@ logger = logging.getLogger("run_project")
 
 _CPU_COUNT = os.cpu_count() or 1
 DEFAULT_NUM_WORKERS = max(1, min(8, _CPU_COUNT // 2))
+
+
+def format_artifact_path(path: Path, root: Path) -> str:
+    """Return path relative to the run directory when possible."""
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def save_classifier_artifact(
+    model: nn.Module,
+    mode: str,
+    out_dir: Path,
+    threshold: float,
+    feature_input_dim: int,
+    feature_embedding_dim: int,
+    metrics: dict,
+    split_sizes: dict,
+):
+    models_dir = out_dir / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    weight_path = models_dir / f"classifier_{mode}.pt"
+    cpu_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+    torch.save(cpu_state, weight_path)
+    metadata = {
+        "split": mode,
+        "model_class": model.__class__.__name__,
+        "feature_input_dim": feature_input_dim,
+        "feature_embedding_dim": feature_embedding_dim,
+        "best_threshold": threshold,
+        "metrics": metrics,
+        "split_sizes": split_sizes,
+        "saved_at": datetime.utcnow().isoformat() + "Z",
+    }
+    metadata_path = models_dir / f"classifier_{mode}.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    return weight_path, metadata_path
+
+
+def write_run_summary(out_dir: Path, notes: list[str]) -> Path:
+    summary_path = out_dir / "run_summary.txt"
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    lines = [
+        f"Run completed: {timestamp}",
+        f"Artifacts directory: {out_dir}",
+        "",
+        "Saved artifacts:",
+    ]
+    if notes:
+        lines.extend(f"- {note}" for note in notes)
+    else:
+        lines.append("- None recorded")
+    summary_path.write_text("\n".join(lines))
+    return summary_path
 
 
 def make_dataloader(dataset, batch_size, shuffle=False):
@@ -86,7 +141,7 @@ def parse_args():
     parser.add_argument(
         "--subgraph_hops",
         type=int,
-        choices=[0, 2, 3],
+        choices=[0, 1, 2, 3],
         default=0,
         help="Hop-limited subgraph around label entities (0 = full KG)",
     )
@@ -167,6 +222,43 @@ def choose_device():
     return torch.device(f"cuda:{device_index}")
 
 
+def limit_kg_with_label_entities(kg_df: pd.DataFrame, labels_df: pd.DataFrame, max_triples: int, seed: int):
+    if max_triples <= 0 or len(kg_df) <= max_triples:
+        return kg_df, 0
+    if labels_df.empty:
+        logger.warning("No label rows available; falling back to random KG sampling (%d triples)", max_triples)
+        limited = kg_df.sample(n=max_triples, random_state=seed).reset_index(drop=True)
+        return limited, 0
+    label_entities = set(pd.unique(labels_df[["c1", "c2", "target"]].values.ravel()))
+    if not label_entities:
+        logger.warning("Label entities set is empty; falling back to random KG sampling (%d triples)", max_triples)
+        limited = kg_df.sample(n=max_triples, random_state=seed).reset_index(drop=True)
+        return limited, 0
+    coverage_mask = kg_df["subject"].isin(label_entities) | kg_df["object"].isin(label_entities)
+    label_edges = kg_df[coverage_mask]
+    label_edge_count = len(label_edges)
+    if label_edge_count == 0:
+        logger.warning("No KG edges matched the label entities; falling back to random KG sampling (%d triples)", max_triples)
+        limited = kg_df.sample(n=max_triples, random_state=seed).reset_index(drop=True)
+        return limited, 0
+    if label_edge_count >= max_triples:
+        limited = label_edges.sample(n=max_triples, random_state=seed).reset_index(drop=True)
+        return limited, max_triples
+    remaining = kg_df[~coverage_mask]
+    additional_needed = max_triples - label_edge_count
+    additional_count = min(additional_needed, len(remaining))
+    if additional_count > 0:
+        sampled_additional = remaining.sample(n=additional_count, random_state=seed)
+        combined = pd.concat([label_edges, sampled_additional], ignore_index=True)
+    else:
+        combined = label_edges.copy()
+    combined = combined.drop_duplicates()
+    if len(combined) > max_triples:
+        combined = combined.sample(n=max_triples, random_state=seed)
+    limited = combined.sample(frac=1, random_state=seed).reset_index(drop=True)
+    return limited, label_edge_count
+
+
 def record_progress(out_dir: Path, stage: str, status: str, detail: str = ""):
     progress_path = out_dir / "progress.json"
     progress = {}
@@ -202,6 +294,7 @@ def run_ablation_baselines(pair_splits, entity2id, embeddings, device, args):
     batch_size = args.classifier_batch_size
     pos_weight = (len(train) - train["label"].sum()) / max(train["label"].sum(), 1)
     pos_weight_tensor = torch.tensor(pos_weight, device=device)
+    feature_dim = embeddings.shape[1]
     id_train = IDTripleDataset(train, entity2id)
     id_val = IDTripleDataset(val, entity2id)
     id_test = IDTripleDataset(test, entity2id)
@@ -235,7 +328,7 @@ def run_ablation_baselines(pair_splits, entity2id, embeddings, device, args):
     )
     random_val_loader = make_dataloader(FeatureDataset(val, entity2id, random_embeddings), batch_size)
     random_test_loader = make_dataloader(FeatureDataset(test, entity2id, random_embeddings), batch_size)
-    random_model = FeatureClassifier(7 * args.embed_dim).to(device)
+    random_model = FeatureClassifier(7 * feature_dim).to(device)
     random_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
     random_optimizer = torch.optim.Adam(random_model.parameters(), lr=1e-3)
     random_results = train_and_evaluate(
@@ -263,6 +356,7 @@ def main():
     src_dir = Path(args.src_dir)
     out_dir = Path(args.out_dir)
     ensure_outdir(out_dir, args.force)
+    artifact_notes: list[str] = []
     device = choose_device()
     if args.run_tests:
         record_progress(out_dir, "tests", "complete", "pytest run before pipeline")
@@ -276,16 +370,6 @@ def main():
         kg_df = read_kg(kg_parts)
         logger.info("Loaded KG edges (%d) from %s", len(kg_df), src_dir)
         persist_kg(kg_df, out_dir)
-    if args.max_kg_triples and args.max_kg_triples > 0 and len(kg_df) > args.max_kg_triples:
-        kg_df = kg_df.sample(n=args.max_kg_triples, random_state=args.seed).reset_index(drop=True)
-        logger.info("Limiting KG to %d triples (max=%d)", len(kg_df), args.max_kg_triples)
-    stats = log_kg_stats(kg_df)
-    record_progress(
-        out_dir,
-        "kg_ingestion",
-        "complete",
-        "cached KG edges" if kg_cached else f"{stats['edges']} edges",
-    )
     labels_clean_path = out_dir / "labels_clean.parquet"
     labels_cached = labels_clean_path.exists() and not args.force
     if labels_cached:
@@ -308,6 +392,22 @@ def main():
         "labels_normalized",
         "complete",
         "cached normalized labels" if labels_cached else f"{norm_stats['examples']} examples",
+    )
+    if args.max_kg_triples and args.max_kg_triples > 0 and len(kg_df) > args.max_kg_triples:
+        kg_df, label_edge_count = limit_kg_with_label_entities(kg_df, labels_cleaned, args.max_kg_triples, args.seed)
+        if label_edge_count:
+            detail = (
+                f"{len(kg_df)} triples with {label_edge_count} touching label entities"
+            )
+        else:
+            detail = f"{len(kg_df)} triples"
+        logger.info("Limiting KG to %s (max=%d)", detail, args.max_kg_triples)
+    stats = log_kg_stats(kg_df)
+    record_progress(
+        out_dir,
+        "kg_ingestion",
+        "complete",
+        "cached KG edges" if kg_cached else f"{stats['edges']} edges",
     )
     entity_set = set(pd.unique(kg_df[["subject", "object"]].values.ravel()))
     labels_filtered_path = out_dir / "labels_filtered.parquet"
@@ -348,6 +448,8 @@ def main():
         relation2id = json.loads(relation2id_path.read_text())
     else:
         entity2id, relation2id = build_id_mappings(kg_df, out_dir)
+    artifact_notes.append(f"Entity ID mapping: {format_artifact_path(entity2id_path, out_dir)}")
+    artifact_notes.append(f"Relation ID mapping: {format_artifact_path(relation2id_path, out_dir)}")
     record_progress(
         out_dir,
         "mappings_built",
@@ -365,6 +467,13 @@ def main():
             embed_stats = json.loads(embedding_stats_path.read_text())
         else:
             embed_stats = {"entities": embeddings.shape[0], "dim": embeddings.shape[1], "epochs": args.embed_epochs}
+        needs_resave = np.iscomplexobj(embeddings) or embeddings.dtype != np.float32
+        if needs_resave:
+            embeddings = ensure_real_embeddings(embeddings)
+            np.save(embeddings_path, embeddings)
+        if embed_stats.get("dim") != embeddings.shape[1] or needs_resave:
+            embed_stats["dim"] = embeddings.shape[1]
+            embedding_stats_path.write_text(json.dumps(embed_stats, indent=2))
         logger.info("Reusing cached embeddings (%d × %d) from %s", embed_stats["entities"], embed_stats["dim"], embeddings_path)
     else:
         embeddings, embed_stats = train_pykeen(
@@ -381,12 +490,16 @@ def main():
             device=device,
         )
         embedding_stats_path.write_text(json.dumps(embed_stats, indent=2))
+    artifact_notes.append(f"Node embeddings: {format_artifact_path(embeddings_path, out_dir)}")
+    artifact_notes.append(f"Embedding stats: {format_artifact_path(embedding_stats_path, out_dir)}")
     record_progress(
         out_dir,
         "kg_embeddings",
         "complete",
         "cached embeddings" if embeddings_cached else f"{embed_stats['entities']} vectors × {embed_stats['dim']} dim; epochs {embed_stats['epochs']}",
     )
+    feature_embedding_dim = embeddings.shape[1]
+    feature_input_dim = 7 * feature_embedding_dim
     split_modes = [args.split_mode] if args.split_mode != "both" else ["random", "pair_holdout"]
     metrics = {}
     main_predictions = None
@@ -406,6 +519,10 @@ def main():
             len(test_df),
         )
         save_split_dfs(mode, train_df, val_df, test_df, out_dir)
+        split_base = out_dir / "splits" / mode
+        artifact_notes.append(
+            f"{mode} split parquet files: {format_artifact_path(split_base, out_dir)}"
+        )
         leakage = leakage_audit(train_df, test_df, mode)
         train_dataset = FeatureDataset(train_df, entity2id, embeddings)
         val_dataset = FeatureDataset(val_df, entity2id, embeddings)
@@ -414,7 +531,7 @@ def main():
         train_loader = make_dataloader(train_dataset, batch_size, shuffle=True)
         val_loader = make_dataloader(val_dataset, batch_size)
         test_loader = make_dataloader(test_dataset, batch_size)
-        model = FeatureClassifier(7 * args.embed_dim).to(device)
+        model = FeatureClassifier(feature_input_dim).to(device)
         pos_weight = (len(train_df) - train_df["label"].sum()) / max(train_df["label"].sum(), 1)
         criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -454,6 +571,20 @@ def main():
         val_roc = metrics[mode]["val_metrics"].get("roc_auc")
         detail = f"val ROC {val_roc:.4f}" if val_roc is not None else "val ROC N/A"
         record_progress(out_dir, f"classifier_{mode}", "complete", detail)
+        split_sizes = {"train": len(train_df), "val": len(val_df), "test": len(test_df)}
+        weight_path, metadata_path = save_classifier_artifact(
+            model,
+            mode,
+            out_dir,
+            results["best_threshold"],
+            feature_input_dim,
+            feature_embedding_dim,
+            metrics[mode],
+            split_sizes,
+        )
+        artifact_notes.append(
+            f"{mode} classifier weights: {format_artifact_path(weight_path, out_dir)} (metadata: {format_artifact_path(metadata_path, out_dir)})"
+        )
         if mode == "pair_holdout" or (mode == "random" and not main_predictions):
             main_predictions = (test_df, results["test_probs"], mode)
             chosen_test_df = test_df
@@ -463,6 +594,7 @@ def main():
     else:
         metrics["ablations"] = {}
     write_metrics(metrics, out_dir)
+    artifact_notes.append(f"Metrics JSON: {format_artifact_path(out_dir / 'metrics.json', out_dir)}")
     report_lines = [
         f"KG edges: {stats['edges']}",
         f"Clean labels: {norm_stats['examples']} examples",
@@ -475,10 +607,19 @@ def main():
         report_lines.append("Ablation (ID-only) ROC AUC = {:.4f}".format(metrics["ablations"]["id_only"]["test_metrics"]["roc_auc"]))
         report_lines.append("Ablation (random embeddings) ROC AUC = {:.4f}".format(metrics["ablations"]["random_embedding"]["test_metrics"]["roc_auc"]))
     write_report(report_lines, out_dir)
+    artifact_notes.append(f"Report: {format_artifact_path(out_dir / 'report.txt', out_dir)}")
     if main_predictions and chosen_test_df is not None:
         write_predictions(chosen_test_df, main_predictions[1], out_dir, main_predictions[2])
+        artifact_notes.append(
+            f"Predictions CSV: {format_artifact_path(out_dir / 'predictions_test.csv', out_dir)}"
+        )
     record_progress(out_dir, "evaluation", "complete", "Metrics, report, predictions written")
-    logger.info("Pipeline completed; outputs under %s", out_dir)
+    summary_path = write_run_summary(out_dir, artifact_notes)
+    logger.info(
+        "Pipeline completed; outputs under %s (summary: %s)",
+        out_dir,
+        format_artifact_path(summary_path, out_dir),
+    )
 
 
 if __name__ == "__main__":
@@ -489,3 +630,13 @@ if __name__ == "__main__":
 #sample prompt
 #python run_project.py --src_dir ./src --out_dir ./artifacts --kg_model rotate --embed_dim 200 --embed_epochs 1 --embed_batch_size 512 --embed_lr 1e-3 --classifier_epochs 5 --classifier_batch_size 128 --split_mode both --seed 42 --subgraph_hops 0 --run_tests 1
 #python run_project.py --src_dir ./src --out_dir ./artifacts --kg_model rotate --embed_dim 200 --embed_epochs 50 --embed_batch_size 4096 --embed_lr 1e-3 --classifier_epochs 30 --classifier_patience 5 --classifier_batch_size 512 --split_mode both --seed 42 --subgraph_hops 2 --run_tests 0 --force
+
+
+'''python run_project.py \
+    --max_kg_triples 50000 \
+    --embed_epochs 1 \
+    --embed_batch_size 256 \
+    --classifier_epochs 1 \
+    --classifier_batch_size 128 \
+    --force
+'''

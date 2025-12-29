@@ -1,26 +1,33 @@
-from collections import defaultdict
-from typing import Iterable
+from typing import Iterable, Set
 
 import pandas as pd
+
+
+def _gather_neighbors(kg_df: pd.DataFrame, frontier: Set[str]) -> Set[str]:
+    if not frontier:
+        return set()
+    mask = kg_df["subject"].isin(frontier) | kg_df["object"].isin(frontier)
+    if not mask.any():
+        return set()
+    edges = kg_df.loc[mask, ["subject", "object"]]
+    # Flatten to get all adjacent nodes touching the current frontier.
+    neighbors = pd.unique(edges.values.ravel(order="K"))
+    return set(neighbors)
 
 
 def extract_subgraph(kg_df: pd.DataFrame, seeds: Iterable[str], hops: int) -> pd.DataFrame:
     if hops <= 0:
         return kg_df
-    neighbors = defaultdict(set)
-    for _, row in kg_df.iterrows():
-        neighbors[row["subject"]].add(row["object"])
-        neighbors[row["object"]].add(row["subject"])
-    visited = set(seeds)
-    frontier = set(seeds)
+    visited: Set[str] = set(seeds)
+    if not visited:
+        return kg_df.iloc[0:0].copy()
+    frontier: Set[str] = set(visited)
     for _ in range(hops):
-        next_frontier = set()
-        for node in frontier:
-            next_frontier.update(neighbors.get(node, []))
-        next_frontier -= visited
-        if not next_frontier:
+        neighbors = _gather_neighbors(kg_df, frontier)
+        neighbors -= visited
+        if not neighbors:
             break
-        visited.update(next_frontier)
-        frontier = next_frontier
-    sub_df = kg_df[kg_df["subject"].isin(visited) & kg_df["object"].isin(visited)].reset_index(drop=True)
-    return sub_df
+        visited.update(neighbors)
+        frontier = neighbors
+    mask = kg_df["subject"].isin(visited) & kg_df["object"].isin(visited)
+    return kg_df.loc[mask].reset_index(drop=True)
