@@ -1,4 +1,4 @@
-# agent.md — KG-informed two-component association prediction
+d# agent.md — KG-informed two-component association prediction
 
 ## Objective
 Build an end-to-end pipeline that uses a biomedical knowledge graph (stored as multiple Parquet parts) plus two labeled CSV files to train a model that predicts whether a triple `(chemical_1, chemical_2, target)` is a **positive association (1)** or **negative association (0)**.
